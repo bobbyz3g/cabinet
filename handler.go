@@ -1,15 +1,15 @@
 package cabinet
 
 import (
-	"io"
+	"errors"
 	"math/rand"
-	"mime/multipart"
-	"os"
 	"strconv"
 	"time"
 
 	"github.com/labstack/echo/v4"
 )
+
+var ErrReceiveTimeout = errors.New("wait receive timeout")
 
 // r is a variable of type `*rand.Rand` that is used for
 // generating random integers.
@@ -22,38 +22,40 @@ func GenerateCode() string {
 	return strconv.Itoa(r.Intn(9000) + 1000)
 }
 
-type SaveHandler struct {
-	Ctx echo.Context
-	fh  *multipart.FileHeader
-	src multipart.File
-	dst *os.File
-	err error
+type PushHandler struct {
+	Sessions *Sessions
+
+	err  error
+	code Code
+	done chan struct{}
 }
 
-func (s *SaveHandler) FormFile(name string) {
-	s.fh, s.err = s.Ctx.FormFile(name)
-}
-
-func (s *SaveHandler) OpenFileHeader() {
-	if s.err != nil {
+func (p *PushHandler) Prepare(ctx echo.Context) {
+	fh, err := ctx.FormFile("file")
+	if err != nil {
+		p.err = err
 		return
 	}
-	s.src, s.err = s.fh.Open()
+
+	p.done = make(chan struct{})
+	p.code = Code(ctx.FormValue("code"))
+
+	t := &Translator{Name: fh.Filename, Done: p.done}
+	t.Reader, p.err = fh.Open()
+	p.Sessions.Push(p.code, t)
 }
 
-func (s *SaveHandler) OpenOSFile(name string, flag int, perm os.FileMode) {
-	if s.err != nil {
-		return
+func (p *PushHandler) Flush() error {
+	if p.err != nil {
+		return p.err
 	}
-	s.dst, s.err = os.OpenFile(name, flag, perm)
-}
 
-func (s *SaveHandler) Save() {
-	if s.err != nil {
-		return
+	select {
+	case <-p.done:
+		return nil
+	case <-time.After(time.Minute):
+		// remove translator from session, avoid memory leak
+		p.Sessions.Pop(p.code)
+		return ErrReceiveTimeout
 	}
-	_, s.err = io.Copy(s.dst, s.src)
-}
-func (s *SaveHandler) Err() error {
-	return s.err
 }
